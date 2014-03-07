@@ -109,6 +109,10 @@
 #define SCHED_RR -1
 #endif
 
+#ifdef HAVE_LINUX_SCHED_H
+#include <linux/sched.h>
+#endif
+
 #if defined(OSLinux)
 /* This comes from TASK_COMM_LEN defined in Linux' include/linux/sched.h. */
 #define PROCESS_NAME_SIZE 15
@@ -180,6 +184,7 @@ static char what_stop[1024];
 static const char *progname = "";
 static int nicelevel = 0;
 static int umask_value = -1;
+static bool isolate = false;
 
 static struct stat exec_stat;
 #if defined(OSHurd)
@@ -460,6 +465,10 @@ usage(void)
 "  -I|--iosched <class[:prio]>   use <class> with <prio> to set the IO\n"
 "                                  scheduler (default prio is 4)\n"
 "  -k|--umask <mask>             change the umask to <mask> before starting\n"
+#ifdef HAVE_CLONE_NEWPID
+"     --isolate                  isolate the process by unsharing its\n"
+"                                MOUNT, PID and IPC namespaces\n"
+#endif
 "  -b|--background               force the process to detach\n"
 "  -C|--no-close                 do not close any file descriptor\n"
 "  -m|--make-pidfile             create the pidfile before starting\n"
@@ -831,6 +840,7 @@ parse_options(int argc, char * const *argv)
 		{ "procsched",	  1, NULL, 'P'},
 		{ "iosched",	  1, NULL, 'I'},
 		{ "umask",	  1, NULL, 'k'},
+		{ "isolate",      1, NULL, 501},
 		{ "background",	  0, NULL, 'b'},
 		{ "no-close",	  0, NULL, 'C'},
 		{ "make-pidfile", 0, NULL, 'm'},
@@ -940,6 +950,11 @@ parse_options(int argc, char * const *argv)
 			break;
 		case 'd':  /* --chdir /new/dir */
 			changedir = optarg;
+			break;
+		case 501: /* --isolate */
+		#ifdef HAVE_CLONE_NEWPID
+			isolate = true;
+		#endif
 			break;
 		default:
 			/* Message printed by getopt. */
@@ -1516,12 +1531,132 @@ do_findprocs(void)
 }
 
 static void
+do_continue_start(int argc, char **argv);
+
+#ifdef HAVE_CLONE_NEWPID
+
+static int mount_fs(const char *source, const char *target, const char *type)
+{
+	/* the umount may fail */
+	if (umount(target))
+		if (quietmode < 0)
+			warning("failed to unmount %s (%s)\n", target, strerror(errno));
+
+	if (mount(source, target, type, 0, NULL)) {
+		if (quietmode < 0)
+			warning("failed to mount %s (%s)\n", target, strerror(errno));
+		return -1;
+	}
+
+	return 0;
+}
+
+void setup_fs(void)
+{
+	if (mount_fs("proc", "/proc", "proc"))
+		if (quietmode < 0)
+			warning("failed to remount proc\n");
+
+	/* if we can't mount /dev/shm, continue anyway */
+	if (mount_fs("shmfs", "/dev/shm", "tmpfs"))
+		if (quietmode < 0)
+			warning("failed to mount /dev/shm\n");
+
+	/* If we were able to mount /dev/shm, then /dev exists */
+	/* Sure, but it's read-only per config :) */
+	if (access("/dev/mqueue", F_OK) && mkdir("/dev/mqueue", 0666)) {
+		return;
+	}
+
+	/* continue even without posix message queue support */
+	if (mount_fs("mqueue", "/dev/mqueue", "mqueue"))
+		if (quietmode < 0)
+			warning("failed to mount /dev/mqueue\n");
+}
+
+struct clone_arg {
+	int argc;
+	char **argv;
+};
+
+static int do_clone(void *arg)
+{
+	struct clone_arg *clone_arg = arg;
+	setup_fs();
+	do_continue_start(clone_arg->argc, clone_arg->argv);
+
+	return 1;
+}
+
+int pipefd[2];
+
+void dummy_signal_handler(int dummy) {
+}
+
+static void
+do_isolate(int argc, char **argv)
+{
+	struct clone_arg clone_arg = {
+		.argc = argc,
+		.argv = argv
+	};
+
+	size_t stack_size = sysconf(_SC_PAGESIZE);
+	void *stack = alloca(stack_size);
+	pid_t pid;
+	int status;
+	int flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC;
+
+	if (background || (pipe(pipefd) < 0)) {
+		pipefd[0] = -1;
+		pipefd[1] = -1;
+	}
+
+#ifdef __ia64__
+	pid = __clone2(do_clone, stack,
+			stack_size, flags | SIGCHLD, &clone_arg);
+#else
+	pid = clone(do_clone, stack  + stack_size, flags | SIGCHLD, &clone_arg);
+#endif
+	if (pid < 0)
+		fatal("failed to clone(0x%x) ", flags);
+
+
+	if (mpidfile && pidfile != NULL)
+		/* User wants _us_ to make the pidfile. */
+		write_pidfile(pidfile, pid);
+
+	if (background)
+		return;
+
+	/* make sure we don't ignore SIGCHLD */
+	struct sigaction sa;
+	sa.sa_handler = dummy_signal_handler;
+	sa.sa_flags = 0;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGCHLD, &sa, NULL);
+
+	/* if it's a forking daemon */
+	fd_set rfds;
+	FD_ZERO(&rfds);
+	FD_SET(pipefd[0], &rfds);
+	if (select(FD_SETSIZE, &rfds, NULL, NULL, NULL) > 0) {
+		if (quietmode < 0)
+			printf("Child forked\n");
+		return;
+	}
+
+	if (waitpid(pid, &status, 0) < 0) {
+		fatal("failed to wait for '%d'", pid);
+	}
+}
+#else
+#define do_isolate(...) 0
+#endif
+
+static void
 do_start(int argc, char **argv)
 {
-	int devnull_fd = -1;
-	gid_t rgid;
-	uid_t ruid;
-
 	do_findprocs();
 
 	if (found) {
@@ -1554,12 +1689,25 @@ do_start(int argc, char **argv)
 	}
 	if (testmode)
 		exit(0);
-	if (quietmode < 0)
+   	if (quietmode < 0)
 		printf("Starting %s...\n", startas);
 	*--argv = startas;
 	if (background)
 		/* Ok, we need to detach this process. */
 		daemonize();
+	if (isolate)
+		do_isolate(argc, argv);
+	else
+		do_continue_start(argc, argv);
+}
+
+static void
+do_continue_start(int argc, char **argv)
+{
+	int devnull_fd = -1;
+	gid_t rgid;
+	uid_t ruid;
+
 	if (background && close_io) {
 		devnull_fd = open("/dev/null", O_RDWR);
 		if (devnull_fd < 0)
@@ -1576,7 +1724,7 @@ do_start(int argc, char **argv)
 		set_io_schedule(io_sched);
 	if (umask_value >= 0)
 		umask(umask_value);
-	if (mpidfile && pidfile != NULL)
+	if (!isolate && mpidfile && pidfile != NULL)
 		/* User wants _us_ to make the pidfile. */
 		write_pidfile(pidfile, getpid());
 	if (changeroot != NULL) {
@@ -1624,7 +1772,48 @@ do_start(int argc, char **argv)
 		for (i = get_open_fd_max() - 1; i >= 3; --i)
 			close(i);
 	}
-	execv(startas, argv);
+
+	pid_t pid = -1;
+	if (isolate) {
+		pid = fork();
+	}
+
+	if (pid > 0) {
+		/* Parent */
+		struct pid_list *p;
+		int status = 0;
+
+		cmdname = userspec = execname = 0;
+
+		/* make sure we don't ignore SIGTERM */
+		struct sigaction sa;
+		sa.sa_handler = dummy_signal_handler;
+		sa.sa_flags = 0;
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGTERM, &sa, NULL);
+
+		int ret = wait(&status);
+		do {
+			if (ret == pid) {
+				if (pipefd[1] > 0) {
+					write(pipefd[1], "1", 1);
+					close(pipefd[1]);
+				}
+				pid = 0;
+			}
+			pid_list_free(&found);
+			do_procinit();
+			if (found->next == NULL) {
+				if (quietmode < 0)
+					printf("Exiting.\n");
+				break;
+			}
+		} while ((ret = wait(&status)) > 0);
+		return;
+	} else {
+		execv(startas, argv);
+	}
+
 	fatal("unable to start %s", startas);
 }
 

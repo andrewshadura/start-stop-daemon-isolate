@@ -13,13 +13,13 @@ CPPFLAGS = \
 	-I.
 
 MKC_REQUIRE_HEADERS = stddef.h sys/syscall.h error.h
-MKC_CHECK_HEADERS = kvm.h
+MKC_CHECK_HEADERS = linux/sched.h kvm.h
 
 MKC_REQUIRE_FUNCLIBS = strnlen strerror strsignal strndup asprintf snprintf scandir alphasort unsetenv setsid
-MKC_CHECK_FUNCLIBS = 
+MKC_CHECK_FUNCLIBS = clone
 
 MKC_REQUIRE_DEFINES = offsetof:stddef.h va_copy:stdarg.h
-MKC_CHECK_DEFINES = TIOCNOTTY:termios.h
+MKC_CHECK_DEFINES = CLONE_NEWPID:linux/sched.h TIOCNOTTY:termios.h
 
 SRC = start-stop-daemon.c
 
