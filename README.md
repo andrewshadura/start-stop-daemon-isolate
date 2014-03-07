@@ -8,3 +8,7 @@ Note that when isolation is enabled, an additional process is created,
 which serves as an init processor in the new PID namespace. This is
 required for running forking daemons, as all processes in a namespace
 are terminated when an init process exits.
+
+To build this version of `start-stop-daemon`, you need to install
+[mk-configure](http://sourceforge.net/projects/mk-configure/)
+and run `mkcmake`.
