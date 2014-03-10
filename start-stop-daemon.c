@@ -1779,6 +1779,7 @@ do_continue_start(int argc, char **argv)
 	}
 
 	if (pid > 0) {
+        #ifdef HAVE_CLONE_NEWPID
 		/* Parent */
 		struct pid_list *p;
 		int status = 0;
@@ -1810,6 +1811,7 @@ do_continue_start(int argc, char **argv)
 			}
 		} while ((ret = wait(&status)) > 0);
 		return;
+        #endif
 	} else {
 		execv(startas, argv);
 	}
